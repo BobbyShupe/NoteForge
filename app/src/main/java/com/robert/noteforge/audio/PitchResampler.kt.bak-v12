@@ -1,0 +1,77 @@
+package com.robert.noteforge.audio
+
+import kotlin.math.pow
+import kotlin.math.roundToInt
+
+/**
+ * Resamples PCM data to shift pitch, using the standard equal-temperament
+ * ratio 2^(semitones/12). Linear interpolation keeps this lightweight
+ * enough to run per-note at sequencing time on-device.
+ */
+object PitchResampler {
+
+    fun semitoneRatio(fromMidi: Int, toMidi: Int): Double =
+        2.0.pow((toMidi - fromMidi) / 12.0)
+
+    /** Returns a new mono ShortArray resampled by [ratio] (ratio > 1 = higher pitch, shorter). */
+    fun resample(source: ShortArray, ratio: Double): ShortArray {
+        if (ratio == 1.0 || source.isEmpty()) return source
+        val outLength = (source.size / ratio).roundToInt().coerceAtLeast(1)
+        val out = ShortArray(outLength)
+        for (i in 0 until outLength) {
+            val srcPos = i * ratio
+            val idx = srcPos.toInt()
+            val frac = srcPos - idx
+            val a = source.getOrElse(idx) { source.last() }
+            val b = source.getOrElse(idx + 1) { source.last() }
+            out[i] = (a + (b - a) * frac).roundToInt().toShort()
+        }
+        return out
+    }
+
+    /** Down-mixes interleaved multi-channel PCM to mono. */
+    fun toMono(source: ShortArray, channelCount: Int): ShortArray {
+        if (channelCount <= 1) return source
+        val frames = source.size / channelCount
+        val out = ShortArray(frames)
+        for (f in 0 until frames) {
+            var sum = 0
+            for (c in 0 until channelCount) sum += source[f * channelCount + c]
+            out[f] = (sum / channelCount).toShort()
+        }
+        return out
+    }
+
+    fun applyGain(source: ShortArray, gain: Float): ShortArray {
+        if (gain == 1.0f) return source
+        return ShortArray(source.size) { i ->
+            val v = (source[i] * gain).roundToInt()
+            v.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+        }
+    }
+
+    /**
+     * Cuts the buffer to [durationMs] with a short fade-out at the end, so a
+     * sequenced note stops when its written duration ends instead of ringing
+     * through the whole sample. Buffers already shorter than the duration are
+     * returned untouched.
+     */
+    fun limitDuration(
+        source: ShortArray,
+        sampleRate: Int,
+        durationMs: Double,
+        fadeMs: Double = 30.0
+    ): ShortArray {
+        if (source.isEmpty() || durationMs <= 0.0) return ShortArray(0)
+        val maxSamples = ((durationMs / 1000.0) * sampleRate).roundToInt().coerceAtLeast(1)
+        if (source.size <= maxSamples) return source
+        val out = source.copyOf(maxSamples)
+        val fadeSamples = ((fadeMs / 1000.0) * sampleRate).roundToInt().coerceIn(1, maxSamples)
+        for (i in 0 until fadeSamples) {
+            val k = i.toFloat() / fadeSamples
+            val idx = maxSamples - fadeSamples + i
+            out[idx] = (out[idx] * k).roundToInt().toShort()
+        }
+        return out
+    }
+}

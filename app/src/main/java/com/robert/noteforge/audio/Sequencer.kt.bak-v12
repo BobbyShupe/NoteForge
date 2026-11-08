@@ -1,0 +1,182 @@
+package com.robert.noteforge.audio
+
+import com.robert.noteforge.data.AudioFileRepository
+import com.robert.noteforge.data.Instrument
+import com.robert.noteforge.data.InstrumentRepository
+import com.robert.noteforge.data.ScoreNote
+import com.robert.noteforge.data.Track
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Walks the placed notes in beat order and triggers each through the
+ * AudioEngine at the right wall-clock offset for the current tempo.
+ */
+@Singleton
+class Sequencer @Inject constructor(
+    private val audioEngine: AudioEngine,
+    private val audioFileRepository: AudioFileRepository,
+    private val instrumentRepository: InstrumentRepository
+) {
+    private val scope = CoroutineScope(Dispatchers.Default)
+    private var playJob: Job? = null
+
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+
+    private val _playheadBeat = MutableStateFlow(0.0)
+    val playheadBeat: StateFlow<Double> = _playheadBeat.asStateFlow()
+
+    private val _soundingIds = MutableStateFlow<Set<Long>>(emptySet())
+    val soundingIds: StateFlow<Set<Long>> = _soundingIds.asStateFlow()
+
+    fun stop() {
+        playJob?.cancel()
+        playJob = null
+        audioEngine.stopNotes()
+        _isPlaying.value = false
+        _playheadBeat.value = 0.0
+        _soundingIds.value = emptySet()
+    }
+
+    /** Pauses playback, keeping the playhead where it is so playback can resume. */
+    fun pause() {
+        playJob?.cancel()
+        playJob = null
+        audioEngine.stopNotes()
+        _isPlaying.value = false
+        _soundingIds.value = emptySet()
+    }
+
+    /** Moves the playhead marker while stopped/paused. */
+    fun seek(beat: Double) {
+        _playheadBeat.value = beat.coerceAtLeast(0.0)
+        _soundingIds.value = emptySet()
+    }
+
+    fun play(notes: List<ScoreNote>, tracks: List<Track>, tempoBpm: Int, startBeat: Double = 0.0) {
+        playJob?.cancel()
+        playJob = null
+        _playheadBeat.value = startBeat.coerceAtLeast(0.0)
+        val fromBeat = _playheadBeat.value
+        if (notes.isEmpty()) {
+            _isPlaying.value = false
+            return
+        }
+
+        val instrumentByTrack = HashMap<Long, Long>() // trackId -> instrumentId
+        tracks.forEach { instrumentByTrack[it.id] = it.instrumentId }
+        val trackById = tracks.associateBy { it.id }
+        val soloIds = tracks.filter { it.solo }.map { it.id }.toSet()
+
+        val msPerBeat = 60_000.0 / tempoBpm
+        // When any track is soloed only soloed tracks sound; otherwise muted tracks are skipped.
+        val sorted = notes
+            .filter { note ->
+                val track = trackById[note.trackId] ?: return@filter false
+                val audible = if (soloIds.isNotEmpty()) note.trackId in soloIds else !track.muted
+                audible && note.startBeat + note.durationBeats > fromBeat
+            }
+            .sortedBy { it.startBeat }
+        if (sorted.isEmpty()) {
+            _isPlaying.value = false
+            return
+        }
+        val endBeat = sorted.maxOf { it.startBeat + it.durationBeats }
+
+        _isPlaying.value = true
+        playJob = scope.launch {
+            val startTime = System.currentTimeMillis()
+            val instrumentCache = HashMap<Long, Instrument?>()
+
+            // Wall-clock ticker so the playhead sweeps smoothly at the exact
+            // playback position instead of jumping from note to note. Also
+            // publishes the notes whose duration window contains the playhead
+            // so the UI can light them while they sound.
+            val ticker = launch {
+                while (isActive) {
+                    val e = System.currentTimeMillis() - startTime
+                    val pb = (fromBeat + e / msPerBeat).coerceAtMost(endBeat)
+                    _playheadBeat.value = pb
+                    val sounding = sorted
+                        .filter { it.startBeat <= pb && pb < it.startBeat + it.durationBeats }
+                        .map { it.id }
+                        .toSet()
+                    if (sounding != _soundingIds.value) _soundingIds.value = sounding
+                    delay(33)
+                }
+            }
+
+            try {
+                for (note in sorted) {
+                    if (!isActive) break
+                    val targetMs = ((note.startBeat - fromBeat) * msPerBeat).toLong().coerceAtLeast(0)
+                    val elapsed = System.currentTimeMillis() - startTime
+                    val waitMs = targetMs - elapsed
+                    if (waitMs > 0) delay(waitMs)
+                    if (!isActive) break
+
+                    // Resolve instrument/audio lookups here (sequentially) so a
+                    // single missing row can't abort the whole schedule loop.
+                    val instrumentId = instrumentByTrack[note.trackId] ?: continue
+                    val instrument = try {
+                        instrumentCache.getOrPut(instrumentId) {
+                            instrumentRepository.getById(instrumentId)
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        continue
+                    } ?: continue
+                    val audioFile = try {
+                        audioFileRepository.getById(instrument.audioFileId)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        continue
+                    } ?: continue
+
+                    // Fire-and-forget per note, isolated: a slow decode or a
+                    // failed AudioTrack for one note must never cancel the
+                    // remaining schedule (previously any throw here tore down
+                    // the whole playJob and cut playback short).
+                    launch {
+                        try {
+                            val rendered = audioEngine.renderNote(audioFile, instrument, note.pitchMidi)
+                            val trackVolume = trackById[note.trackId]?.volume?.coerceIn(0f, 1f) ?: 1f
+                            // Cut the sample to the note's written duration so a
+                            // quarter note stops after a quarter note (30ms fade
+                            // avoids a click at the cutoff point).
+                            val cut = PitchResampler.limitDuration(
+                                rendered,
+                                audioFile.sampleRate,
+                                note.durationBeats * msPerBeat
+                            )
+                            val shaped = PitchResampler.applyGain(cut, note.velocity * trackVolume)
+                            audioEngine.playRaw(shaped, audioFile.sampleRate)
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                        }
+                    }
+                }
+
+                val totalMs = ((endBeat - fromBeat) * msPerBeat).toLong()
+                val remaining = totalMs - (System.currentTimeMillis() - startTime)
+                if (remaining > 0) delay(remaining)
+            } finally {
+                ticker.cancel()
+            }
+            _playheadBeat.value = endBeat
+            _soundingIds.value = emptySet()
+            _isPlaying.value = false
+        }
+    }
+}
